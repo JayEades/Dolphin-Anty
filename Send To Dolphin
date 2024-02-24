@@ -1,0 +1,823 @@
+import os
+import json
+import time
+import random
+import logging
+import requests
+from datetime import datetime
+from airtable import Airtable
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from concurrent.futures import ThreadPoolExecutor
+from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+PAT = ''
+BASE_ID = ''
+PROFILES_TABLE_NAME = 'Profiles'
+INSTAGRAM_TABLE_NAME = "Instagram Scheduler"
+SCHEDULED_RUNS_TABLE_NAME = 'Scheduled Runs'
+
+profiles_table = Airtable(BASE_ID, PROFILES_TABLE_NAME, PAT)
+scheduled_runs_table = Airtable(BASE_ID, SCHEDULED_RUNS_TABLE_NAME, PAT)
+
+bearer_token = ''
+
+swipe_left_js = """
+    const e = document.querySelector("#meetmevotebutton-no");
+    if (e) {
+        e.click();
+    }
+"""
+swipe_right_js = """
+    const e = document.querySelector("#meetmevotebutton-yes");
+    if (e) {
+        e.click();
+    }
+"""
+
+class ProfileChecker:
+    def __init__(self, move_to_completed_runs, record_id, dolphin_prof_id, PAT, BASE_ID):
+
+        self.previous_profile_username = None
+        self.same_profile_count = 0
+        self.move_to_completed_runs = move_to_completed_runs   
+        self.record_id = record_id
+        self.dolphin_prof_id = dolphin_prof_id
+        self.yes_count = 0
+        self.no_count = 0
+        self.PAT = PAT
+        self.BASE_ID = BASE_ID
+
+    def increment_yes_count(self):
+        self.yes_count += 1
+
+    def increment_no_count(self):
+        self.no_count += 1
+
+    def check_profile_and_swipe(self, driver, dolphin_prof_id):
+
+        stop_url = f"http://localhost:3001/v1.0/browser_profiles/{dolphin_prof_id}/stop"
+
+        try:
+            usernameExtractionScript = """
+            const profilePicElement = document.querySelector('meetmeimage') || document.querySelector('.meetmeimage');
+            if (profilePicElement) {
+                const href = profilePicElement.querySelector('a').getAttribute('href');
+                const profileIdMatch = href.match(/profile_id=(\\d+)/);
+                return profileIdMatch ? profileIdMatch[1] : null;
+            }
+            return null;
+            """
+            current_username = driver.execute_script(usernameExtractionScript)
+            print(f"Current username: {current_username}")
+
+            if current_username:
+                if current_username == self.previous_profile_username:
+                    self.same_profile_count += 1
+                else:
+                    self.same_profile_count = 0
+                    self.previous_profile_username = current_username
+
+                if self.same_profile_count >= 4:
+                    clicked = self.attempt_click_no_thanks(driver)
+                    if clicked:
+                        self.same_profile_count = 0
+                        print("Clicked 'No thanks'. Resetting count and continuing.")
+                    else:
+                        print("Failed to click 'No thanks'. Moving current progress to completed runs and stopping the profile...")
+                        self.move_to_completed_runs(self.record_id, self.yes_count, self.no_count, self.dolphin_prof_id, self.PAT, self.BASE_ID)
+                        response = requests.get(stop_url)
+                        data = response.json()
+                        if not data.get('success'):
+                            raise Exception("Failed to stop the Dolphin profile.")
+            else:
+                print("Username not found.")
+        except Exception as e:
+            print(f"An error occurred: {e}")
+
+    def attempt_click_no_thanks(self, driver):
+        try:
+            no_thanks_button = driver.find_element(By.XPATH, "//a[contains(.,'No thanks')]")
+            driver.execute_script("arguments[0].click();", no_thanks_button)
+            return True
+        except Exception as e:
+            print(f"Failed to click 'No thanks'")
+            return False
+
+def get_profile_name(dolphin_prof_id):
+    try:
+        record = scheduled_runs_table.match('Dolphin ID', dolphin_prof_id)
+
+        if record:
+            return record['fields'].get('Dolphin Name')
+        else:
+            print(f"No profile found for Dolphin ID: {dolphin_prof_id}")
+            return None
+    except Exception as e:
+        print(f"An error occurred while fetching the profile name: {e}")
+        return None
+
+def openstatistics(dolphin_prof_id):
+    try:
+        start_url = f"http://localhost:3001/v1.0/browser_profiles/{dolphin_prof_id}/start?automation=1"
+        response = requests.get(start_url)
+        response.raise_for_status()  
+
+        data = response.json()
+        if not data.get('success'):
+            error_details = f"Failed to start the Dolphin Anty profile. Response: {data}"
+            raise Exception(error_details)
+
+        port = data['automation']['port']
+        options = webdriver.ChromeOptions()
+        options.add_argument(f'--remote-debugging-port={port}')
+        options.add_argument('--user-data-dir=./User_Data')
+        debugger_address = f"localhost:{port}"
+        options.debugger_address = debugger_address
+        chrome_driver_path = r"C:\Users\info\Desktoppers\chromedriver-win64\chromedriver.exe"
+        service = Service(executable_path=chrome_driver_path)
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.maximize_window()
+
+        return driver
+    
+    except requests.RequestException as e:
+        print(f"Request error: {e.response.text if e.response else str(e)}")
+        raise
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        raise
+    
+def extract_and_send_model_name(profile_name, PAT, BASE_ID, profiles_table, dolphin_prof_id):
+    model_name = profile_name.split(' ')[0]
+
+    model_name_table = 'To Be Made'
+    to_be_made = Airtable(BASE_ID, model_name_table, PAT)
+    profiles_table = Airtable(BASE_ID, PROFILES_TABLE_NAME, PAT)
+
+    model_record = {'Model Name': model_name, 'Dolphin Status': ['Scheduled'], 'POF Status': ['Scheduled']}
+
+    try:
+        model_record_response = to_be_made.insert(model_record)
+
+        matching_profiles = profiles_table.search('Dolphin ID', dolphin_prof_id)
+
+        if matching_profiles:
+            tags = matching_profiles[0]['fields'].get('Tags', [])
+            if tags:
+                update_record = {'Tags': tags}
+                to_be_made.update(model_record_response['id'], update_record)
+        else:
+            print(f"No matching profile found for Dolphin ID: {dolphin_prof_id}")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+def send_to_discord(message):
+    url = ''  
+    data = {
+        'content': message,
+        'username': 'Message Sender'
+    }
+    result = requests.post(url, data=json.dumps(data), headers={"Content-Type": "application/json"})
+    try:
+        result.raise_for_status()
+    except requests.exceptions.HTTPError as err:
+        print(err)
+    else:
+        pass
+
+def set_all_runs_to_banned(dolphin_prof_id):
+    all_records = scheduled_runs_table.get_all()
+
+    filtered_records = [record for record in all_records if record['fields'].get('Dolphin ID') == dolphin_prof_id]
+
+    for record in filtered_records:
+        record_id = record['id']
+        scheduled_runs_table.update(record_id, {'Running Progress': ['Banned Account']})
+
+def check_profile_alive_or_verification_needed(driver, profile_name, check_fallback=False):
+    wait = WebDriverWait(driver, 10)
+    status = "Unknown - Manual check required"
+
+    try:
+        print(f"{profile_name} is trying to find Agree Button.")
+        print("------------------------------------------------------------------")
+        agree_button = wait.until(EC.presence_of_element_located((By.ID, "user-blocking-agree-button")))
+        time.sleep(3)
+        driver.execute_script("arguments[0].click();", agree_button)
+        print(f"{profile_name} found and clicked Agree Button.")
+        print("------------------------------------------------------------------")
+    except TimeoutException:
+        pass
+
+    try:
+        print(f"{profile_name} is trying to find Need Verify")
+        print("------------------------------------------------------------------")
+        wait.until(EC.presence_of_element_located((By.ID, 'consent-step-verify')))
+        print(f"{profile_name} found Need Verify, Bad.")
+        print("------------------------------------------------------------------")
+        return "Logged in but profile needs verification, banned 🚫"
+    except TimeoutException:
+        print(f"{profile_name} could not find Need Verify, Good.")
+        print("------------------------------------------------------------------")
+        pass
+
+    try:
+        print(f"{profile_name} is trying to find Meet Me.")
+        print("------------------------------------------------------------------")
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'span.css-pvhcm1')))
+        print(f"{profile_name} found Meet Me, Good.")
+        print("------------------------------------------------------------------")
+        return "Successfully logged in, profile alive👍🏼"
+    except TimeoutException:
+        print(f"{profile_name} Couldn't find Meet Me, bad.")
+        print("------------------------------------------------------------------")
+        pass
+
+    try:
+        print(f"{profile_name} is trying to find Like Summary.")
+        print("------------------------------------------------------------------")
+        wait.until(EC.presence_of_element_located((By.ID, 'likesummary-seewho')))
+        print(f"{profile_name} found Like Summary, Good.")
+        print("------------------------------------------------------------------")
+        return "Successfully logged in, Profile alive👍🏼"
+    except TimeoutException:
+        print(f"{profile_name} not found Like Summary, checking Meet Me button.")
+        print("------------------------------------------------------------------")
+        pass
+
+    try:
+        print(f"{profile_name} is trying to find Meet Me.")
+        print("------------------------------------------------------------------")
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'span.css-pvhcm1')))
+        print(f"{profile_name} found Meet Me, Good.")
+        print("------------------------------------------------------------------")
+        return "Successfully logged in, profile alive👍🏼"
+    except TimeoutException:
+        print(f"{profile_name} Couldn't find Meet Me, very bad.")
+        print("------------------------------------------------------------------")
+        pass
+
+    if status == "Unknown - Manual check required" and check_fallback:
+        print(f"{profile_name} Fallback to checking if banned or other issues.")
+        status = check_if_banned_or_other_issues(driver, profile_name, True)  
+    
+    return status
+
+def check_if_banned_or_other_issues(driver, profile_name, check_fallback=False):
+    wait = WebDriverWait(driver, 10)
+    status = "Unknown - Manual check required"
+        
+    driver.get("https://www.pof.com/login/")
+
+    try:
+        print(f"{profile_name} is trying to find Agree Button.")
+        print("------------------------------------------------------------------")
+        agree_button = wait.until(EC.presence_of_element_located((By.ID, "onetrust-accept-btn-handler")))
+        time.sleep(3)
+        driver.execute_script("arguments[0].click();", agree_button)
+        print(f"{profile_name} found and clicked Agree Button.")
+        print("------------------------------------------------------------------")
+    except TimeoutException:
+        pass
+
+    try:
+        print(f"{profile_name} trying to find Login Button.")
+        print("------------------------------------------------------------------")
+        login_button = wait.until(EC.presence_of_element_located((By.ID, 'login-submit')))
+        time.sleep(3)
+        login_button.click()
+        print(f"{profile_name} found and clicked Login Button.")
+        print("------------------------------------------------------------------")
+        time.sleep(5)  
+
+        current_url = driver.current_url
+        if current_url in ["https://www.pof.com/online", "https://www.pof.com/meet"]:
+            print(f"{profile_name} URL hints that profile is logged in.")
+            print("------------------------------------------------------------------")
+            return check_profile_alive_or_verification_needed(driver, profile_name, check_fallback=True)
+        elif current_url == "https://www.pof.com/login/":
+            print(f"{profile_name} URL still on login, continuing.")
+            print("------------------------------------------------------------------")
+            pass
+    except TimeoutException:
+        print(f"{profile_name} Login button not found.")
+        print("------------------------------------------------------------------")
+        pass
+
+    try:
+        print(f"{profile_name} Looking for Deleted User Notification.")
+        print("------------------------------------------------------------------")
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'span[data-automationid="DeletedUserNotification-MainText"]')))
+        print(f"{profile_name} Found Deleted User Notification.")
+        print("------------------------------------------------------------------")
+        return "Deleted user notification was shown, profile is banned 🚫"
+    except TimeoutException:
+        print(f"{profile_name} Could not find Deleted User Notification.")
+        print("------------------------------------------------------------------")
+        pass 
+
+    try:
+        print(f"{profile_name} Looking for Wrong Details Notification.")
+        print("------------------------------------------------------------------")
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#login-password-input-error-helper")))
+        print(f"{profile_name} Found Wrong Details Notification.")
+        print("------------------------------------------------------------------")
+        return "Logged out, probs banned 🚫"
+    except TimeoutException:
+        print(f"{profile_name} Could not find Wrong Details Notification.")
+        print("------------------------------------------------------------------")
+        pass 
+
+    if status == "Unknown - Manual check required" and check_fallback:
+        print(f"{profile_name} Fallback to checking profile alive or verification needed.")
+        status = check_profile_alive_or_verification_needed(driver, profile_name, True)  
+    
+    return status
+
+def start_profile(dolphin_prof_id, profile_name, bearer_token):
+    
+    driver = None
+    status = "Unknown"  
+    expected_url = "https://www.pof.com/meetme"
+    stop_url = f"http://localhost:3001/v1.0/browser_profiles/{dolphin_prof_id}/stop"
+  
+    try:
+        driver = openstatistics(dolphin_prof_id)
+        driver.get(expected_url)
+        time.sleep(5)  
+
+        current_url = driver.current_url
+
+        if current_url == expected_url:
+            print(f"{profile_name} is on the expected page, checking status...")
+            status = check_profile_alive_or_verification_needed(driver, profile_name)
+        else:
+            print(f"{profile_name} was redirected from the expected page, checking if banned...")
+            status = check_if_banned_or_other_issues(driver, profile_name)
+
+        print(f"Final status for {profile_name}: {status}")
+
+        final_driver = handle_status_after_checks(driver, dolphin_prof_id, profile_name, status, bearer_token)
+        return final_driver
+        
+    except Exception as e:
+        print(f"Error with profile {profile_name}: {str(e)}")
+        print("------------------------------------------------------------------")
+        if driver:
+            response = requests.get(stop_url)  
+            data = response.json() 
+            
+            if not data.get('success'):
+                raise Exception("Failed to close the Dolphin Anty profile.") 
+           
+        return None
+    
+def handle_status_after_checks(driver, dolphin_prof_id, profile_name, status, bearer_token):
+    stop_url = f"http://localhost:3001/v1.0/browser_profiles/{dolphin_prof_id}/stop"
+    
+    if "banned" in status.lower():
+        set_all_runs_to_banned(dolphin_prof_id)
+        response = requests.get(stop_url)
+        data = response.json()
+        
+        if not data.get('success'):
+            raise Exception("Failed to close the Dolphin Anty profile.")
+        
+        update_airtable_and_finish(status, dolphin_prof_id, profile_name, scheduled_runs_table, PAT, BASE_ID, bearer_token, driver)
+        return None
+    
+    elif "alive" in status.lower():
+        model_name = profile_name.split(' ')[0]
+        add_instagram(dolphin_prof_id, model_name, INSTAGRAM_TABLE_NAME, PAT, BASE_ID, bearer_token, driver)
+        update_airtable_and_finish(status, dolphin_prof_id, profile_name, scheduled_runs_table, PAT, BASE_ID, bearer_token, driver)
+        return driver
+    
+    elif status == "Unknown":
+        print(f"@everyone {profile_name} MANUAL CHECK NEEDED🚨🚨")
+        response = requests.get(stop_url)
+        data = response.json()
+        
+        if not data.get('success'):
+            raise Exception("Failed to close the Dolphin Anty profile.")
+        return None
+    
+def add_instagram(dolphin_prof_id, model_name, INSTAGRAM_TABLE_NAME, PAT, BASE_ID, bearer_token, driver):
+    add_instagram_table = Airtable(BASE_ID, INSTAGRAM_TABLE_NAME, PAT)
+
+    try:
+        matches = add_instagram_table.search('Dolphin ID', dolphin_prof_id)
+
+        if not matches:
+            print("No matching record found in Airtable.")
+            driver.get("https://www.pof.com/meetme")        
+            return False
+
+        print(f"Match Found. Proceeding with Selenium operations. {dolphin_prof_id}")
+        record_id = matches[0]['id']
+
+        random_wait_time = random.uniform(3, 7)
+
+        try:
+            wait = WebDriverWait(driver, 10)
+
+            driver.get("https://www.pof.com/editprofile")  
+            time.sleep(random_wait_time)
+            
+            driver.execute_script("window.scrollBy(0, 200);")
+            driver.execute_script("window.scrollBy(0, 200);")
+            driver.execute_script("window.scrollBy(0, 200);")
+
+            time.sleep(random_wait_time)
+
+            file_name = f"{model_name.lower()}_insta_box.txt"
+            insta_box_file_path = os.path.join(r'G:\My Drive\Jays Bots\Dating Apps\POF\.txt Files For Dating App Codes', file_name)
+            
+            with open(insta_box_file_path, 'r', encoding='utf-8') as file:
+                insta_boxs = file.readlines()
+
+            chosen_insta_box = random.choice(insta_boxs).strip()
+            insta_box = wait.until(EC.presence_of_element_located((By.XPATH, "//textarea[@id='editprofile-conversationstarter']")))
+
+            time.sleep(random_wait_time)  
+            insta_box.click()  
+            insta_box.send_keys(Keys.END)  
+            time.sleep(0.5) 
+            insta_box.send_keys(Keys.ENTER, Keys.ENTER)
+
+            script = """
+            var elem = arguments[0];
+            var text = arguments[1];
+            elem.value += text;  // Append the text directly without additional new lines
+            elem.dispatchEvent(new Event('change'));  // Ensure the input change is registered
+            """
+            driver.execute_script(script, insta_box, chosen_insta_box)
+
+            time.sleep(random_wait_time)
+
+            driver.execute_script("window.scrollBy(0, 200);")
+            driver.execute_script("window.scrollBy(0, 200);")
+            driver.execute_script("window.scrollBy(0, 200);")
+            driver.execute_script("window.scrollBy(0, 200);")
+            driver.execute_script("window.scrollBy(0, 200);")
+            driver.execute_script("window.scrollBy(0, 200);")
+            driver.execute_script("window.scrollBy(0, 200);")
+            driver.execute_script("window.scrollBy(0, 200);")
+            driver.execute_script("window.scrollBy(0, 200);")
+            driver.execute_script("window.scrollBy(0, 200);")
+            driver.execute_script("window.scrollBy(0, 200);")
+
+            time.sleep(5)
+
+            click_something = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Type an interest and hit enter to add'][@type='text']")))
+            click_something.click()
+
+            time.sleep(2)
+
+            save_changes_button = wait.until(EC.presence_of_element_located((By.ID, "edit-profile-update-profile-button")))
+            driver.execute_script("arguments[0].click();", save_changes_button)
+
+            time.sleep(5)
+            
+            driver.get("https://www.pof.com/meetme")
+            
+            time.sleep(2)
+            
+            print(f"Successfully added Instagram. {dolphin_prof_id}")
+            
+            add_insta_tag(dolphin_prof_id, bearer_token)
+
+            add_instagram_table.delete(record_id)
+            print(f"Record with ID {record_id} deleted from Airtable. {dolphin_prof_id}")
+            return True  
+
+        except Exception as e:
+            print(f"An error occurred during adding Instagram to profile {dolphin_prof_id}: {e}")
+            driver.get("https://www.pof.com/meetme")        
+            return False
+
+    except Exception as e:
+        print(f"An error occurred while accessing Airtable: {e}")
+        return False
+    
+def add_insta_tag(dolphin_id, bearer_token):
+    get_url = f"https://dolphin-anty-api.com/browser_profiles/{dolphin_id}"
+    headers = {
+        "Authorization": f"Bearer {bearer_token}"
+    }
+
+    try:
+        get_response = requests.get(get_url, headers=headers)
+        if get_response.status_code == 200:
+            current_tags = get_response.json()['data'].get('tags', [])
+            if 'Insta' not in current_tags:
+                current_tags.append('Insta')  
+            else:
+                print(f"'Insta' tag already exists for Dolphin ID {dolphin_id}")
+                return
+        else:
+            print(f"Failed to fetch tags for Dolphin ID {dolphin_id}, Status Code: {get_response.status_code}")
+            return
+    except Exception as e:
+        print(f"Error fetching tags for Dolphin ID {dolphin_id}: {e}")
+        return
+
+    patch_url = f"https://dolphin-anty-api.com/browser_profiles/{dolphin_id}"
+    patch_headers = {
+        "Authorization": f"Bearer {bearer_token}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    patch_data = {
+        'tags[]': current_tags
+    }
+
+    try:
+        patch_response = requests.patch(patch_url, headers=patch_headers, data=patch_data)
+        if patch_response.status_code == 200:
+            print(f"'Insta' tag successfully added to Dolphin ID {dolphin_id}")
+        else:
+            print(f"Failed to add 'Insta' tag for Dolphin ID {dolphin_id}, Status Code: {patch_response.status_code}, Response: {patch_response.text}")
+    except Exception as e:
+        print(f"Error adding 'Insta' tag for Dolphin ID {dolphin_id}: {e}")
+
+def update_airtable_and_finish(status, dolphin_prof_id, profile_name, scheduled_runs_table, PAT, BASE_ID, bearer_token, driver):
+    if "banned" in status.lower():
+        record = scheduled_runs_table.match('Dolphin ID', dolphin_prof_id)
+        if record:
+            status_update = {'Status': ['Banned']}
+            scheduled_runs_table.update(record['id'], status_update)
+
+        extract_and_send_model_name(profile_name, PAT, BASE_ID, profiles_table, dolphin_prof_id)
+
+    send_to_discord(f"@everyone {profile_name}: {status}")
+
+    if "banned" in status.lower():
+        if find_and_move_record_in_airtable(dolphin_prof_id, PAT, BASE_ID, driver):
+            url = f"https://dolphin-anty-api.com/browser_profiles/{dolphin_prof_id}?forceDelete=1"
+            headers = {'Authorization': f'Bearer {bearer_token}'}
+            response = requests.delete(url, headers=headers)
+
+            if response.status_code == 200:
+                print(f"Profile deleted successfully in Dolphin Anty {profile_name}")
+            else:
+                print(f"Failed to delete profile in Dolphin Anty. Status code: {response.status_code}")
+        else:
+            print("No matching record found in Airtable. Profile not deleted in Dolphin Anty.")
+
+            stop_url = f"http://localhost:3001/v1.0/browser_profiles/{dolphin_prof_id}/stop"
+            response = requests.get(stop_url)  
+        
+def find_and_move_record_in_airtable(dolphin_prof_id, PAT, BASE_ID, driver=None):
+    existing_table = Airtable(BASE_ID, 'Profiles', PAT)
+    deleted_profiles_table = Airtable(BASE_ID, 'Banned Profiles', PAT)
+
+    matching_records = existing_table.search('Dolphin ID', dolphin_prof_id)
+
+    if matching_records:
+        record = matching_records[0]
+        record_data = record['fields']
+
+        try:
+            response = deleted_profiles_table.insert(record_data)
+            print("Insert response:", response)
+            existing_table.delete(record['id'])
+
+            stop_url = f"http://localhost:3001/v1.0/browser_profiles/{dolphin_prof_id}/stop"
+            response = requests.get(stop_url)
+            data = response.json()
+
+            if not data.get('success'):
+                if driver:
+                    print("Failed to close the Dolphin Anty profile via API. Attempting to close using driver.quit().")
+                    driver.quit()
+                    print("Browser closed using driver.quit().")
+                else:
+                    print("No WebDriver instance provided to close the browser.")
+            
+            return True
+        except Exception as e:
+            
+            print("Error inserting record into Banned Profiles or closing Dolphin Anty profile:", str(e))
+            return False
+
+    return False
+
+def pick_and_update_scheduled_run():
+    filter_formula = "{Running Progress}='Scheduled'"
+    try:
+        scheduled_records = scheduled_runs_table.get_all(formula=filter_formula)
+        if not scheduled_records:
+            print("No scheduled runs available.")
+            return None, None
+        selected_record = random.choice(scheduled_records)
+        record_id = selected_record['id']
+        dolphin_prof_id = selected_record['fields'].get('Dolphin ID')
+        print(dolphin_prof_id)
+        swipe_amount = selected_record['fields'].get('Swipe Amount')
+        current_time = int(datetime.now().strftime('%H%M'))
+        scheduled_runs_table.update(record_id, {
+            'Running Progress': ["Initiating"],  
+            'Time Initiated': current_time  
+        })
+        return record_id, dolphin_prof_id, swipe_amount
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None, None
+
+def check_for_no_more_likes(driver):
+    no_more_likes_xpath = "//div[@id='meet-me-no-more-matches']"
+    try:
+        WebDriverWait(driver, 0).until(EC.presence_of_element_located((By.XPATH, no_more_likes_xpath)))
+        print("Ran out of likes.")
+        return True
+    except Exception as e:
+        return False
+
+def handle_error(e, driver):
+    print(f"An error occurred fuck up")
+    driver.get('https://www.pof.com/meetme')  
+    time.sleep(5)  
+
+def perform_swipes(record_id, driver, total_swipes, left_swipe_percentage, dolphin_prof_id):
+    
+    wait_time_between_swipes = random.randint(2, 9)
+    left_swipes_count = int((left_swipe_percentage / 100) * total_swipes)
+    right_swipes_count = total_swipes - left_swipes_count
+    swipe_actions = ['left'] * left_swipes_count + ['right'] * right_swipes_count
+    random.shuffle(swipe_actions)
+
+    checker = ProfileChecker(move_to_completed_runs, record_id, dolphin_prof_id, PAT, BASE_ID)
+
+    for action in swipe_actions:
+        checker.check_profile_and_swipe(driver, dolphin_prof_id)
+
+        try:
+            if action == 'left':
+                driver.execute_script(swipe_left_js)
+                checker.increment_no_count()
+            else:
+                driver.execute_script(swipe_right_js)
+                checker.increment_yes_count()
+
+            time.sleep(wait_time_between_swipes)
+
+            if check_for_no_more_likes(driver):
+                break
+
+        except Exception as e:
+            try:
+                nofanks = WebDriverWait(driver, 3).until(EC.presence_of_element_located((By.XPATH, "//a[@class='MuiTypography-root MuiTypography-inherit MuiLink-root MuiLink-underlineHover css-16r2qqr']//span[@data-text-spacing='No thanks']")))
+                nofanks.click()
+                time.sleep(5)
+                print("no thanks")
+            except Exception as e_inner:
+                handle_error(e_inner, driver)
+
+    print(f"{dolphin_prof_id} done")
+    print(f"Yes count: {checker.yes_count}")
+    print(f"No count: {checker.no_count}")
+    return checker
+
+def move_to_completed_runs(record_id, yes_count, no_count, dolphin_prof_id, PAT, BASE_ID):
+
+    print("Function called successfully")
+
+    try:
+        scheduled_runs_table = Airtable(BASE_ID, 'Scheduled Runs', PAT)
+        record = scheduled_runs_table.get(record_id)
+        if record:
+            completed_run_data = {
+                'Model Name': record['fields'].get('Model Name'),
+                'Dolphin Name': record['fields'].get('Dolphin Name'),
+                'Dolphin ID': dolphin_prof_id,
+                'Date Ran': datetime.now().strftime('%Y-%m-%d'),
+                'Start': record['fields'].get('Time Initiated'),
+                'End': int(datetime.now().strftime('%H%M')), 
+                'Total Swipes': yes_count + no_count,
+                'No': (no_count / (yes_count + no_count)) * 100 if yes_count + no_count > 0 else 0,  
+                'Running Progress': ['Completed'],
+            }
+            try:
+                # Insert into completed runs table
+                completed_runs_table = Airtable(BASE_ID, 'Completed Runs', PAT)
+                insert_response = completed_runs_table.insert(completed_run_data)
+                logging.info(f"Record inserted to Completed Runs: {insert_response}")
+            except Exception as e:
+                logging.error(f"Error inserting record into Completed Runs: {e}")
+            
+            try:
+                # Delete from scheduled runs table
+                scheduled_runs_table.delete(record_id)
+                logging.info(f"Record deleted from Scheduled Runs: {record_id}")
+                
+            except Exception as e:
+                logging.error(f"Error deleting record from Scheduled Runs: {e}")
+        else:
+            logging.warning(f"Record not found in Scheduled Runs: {record_id}")
+    except Exception as e:
+        logging.error(f"Error retrieving record from Scheduled Runs: {e}")
+
+    send_to_discord(f"@everyone {record['fields'].get('Dolphin Name')}: COMPLETE✅ Swipes = {yes_count + no_count}.")
+
+def profile_thread_function():
+    while True: 
+        try:
+            record_id, dolphin_prof_id, swipe_amount = pick_and_update_scheduled_run()       
+            if dolphin_prof_id:
+                time.sleep(5)
+                Main_func_g(record_id, dolphin_prof_id, swipe_amount)    
+            time.sleep(5)
+        except Exception as e:
+            print(f"An error occurred: {e}")
+
+def Main_func_g(record_id, dolphin_prof_id, swipe_amount, driver):
+    try:
+        if driver:
+            total_swipes = swipe_amount
+            left_swipe_percentage = random.randint(40, 60)
+            print(f"Total swipes: {total_swipes}")
+            checker = perform_swipes(record_id, driver, total_swipes, left_swipe_percentage, dolphin_prof_id)
+            yes_count = checker.yes_count
+            no_count = checker.no_count
+            move_to_completed_runs(record_id, yes_count, no_count, dolphin_prof_id, PAT, BASE_ID)
+        else:
+            print("Driver failed to initialize.")
+    except Exception as e:
+        print(f"An error occurred in Main_func_g")
+    finally:
+        try:
+            print("Trying to close the driver...")
+            stop_url = f"http://localhost:3001/v1.0/browser_profiles/{dolphin_prof_id}/stop"
+            response = requests.get(stop_url)  
+            data = response.json() 
+            
+            if not data.get('success'):
+                raise Exception("Failed to close the Dolphin Anty profile.")
+            
+            print("Closed the main window.")
+        except Exception as e:
+            print("couldnt close the window last going off, run is complted doe.")
+            if driver:
+                driver.quit
+
+def find_matching_runs():
+    matches = []
+    try:
+        scheduled_records = scheduled_runs_table.get_all()
+        current_time = datetime.now().strftime('%H%M')
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        for record in scheduled_records:
+            time_to_run = record['fields'].get('Time To Run')
+            date_to_run = record['fields'].get('Date To Run')
+            running_progress = record['fields'].get('Running Progress', [])
+            
+            # Check if the record is scheduled to run at the current time and date, and if 'Scheduled' is in the Running Progress list
+            if time_to_run and date_to_run and int(time_to_run) == int(current_time) and date_to_run == current_date and "Scheduled" in running_progress:
+                record_id = record['id']
+                # Update the Running Progress to 'Initiating'
+                scheduled_runs_table.update(record_id, {'Running Progress': ['Initiating']})
+                matches.append(record)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    return matches
+
+def initiate_profile_run(record):
+    try:
+        record_id = record['id']
+        dolphin_prof_id = record['fields'].get('Dolphin ID')
+        swipe_amount = record['fields'].get('Swipe Amount')
+
+        if dolphin_prof_id and swipe_amount:
+            profile_name = get_profile_name(dolphin_prof_id)
+            driver = start_profile(dolphin_prof_id, profile_name, bearer_token)
+            if driver:
+                Main_func_g(record_id, dolphin_prof_id, swipe_amount, driver)
+            else:
+                print(f"Profile {dolphin_prof_id} is banned or an error occurred. Skipping swiping process.")
+
+                stop_url = f"http://localhost:3001/v1.0/browser_profiles/{dolphin_prof_id}/stop"
+                response = requests.get(stop_url)
+                data = response.json()
+                
+                if not data.get('success'):
+                    raise Exception("Failed to stop the Dolphin profile.")       
+        else:
+            print(f"Dolphin Profile ID or Swipe Amount not available for record {record_id}.")
+    except Exception as e:
+        print(f"Error in initiating profile run: {e}")
+
+def continuous_check_and_run():
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        while True:
+            matches = find_matching_runs()
+            for record in matches:
+                executor.submit(initiate_profile_run, record)
+            time.sleep(15)  
+
+if __name__ == "__main__":
+    continuous_check_and_run()
